@@ -9987,6 +9987,27 @@ yb_cost_index(IndexPath *path, PlannerInfo *root, double loop_count,
 	if (path->path.parallel_workers > 0)
 	{
 		parallel_divisor = get_parallel_divisor(&path->path);
+
+		/*
+		 * A range-partitioned index range splits into parallel ranges by its
+		 * on-disk size; processes beyond the range count get no work.
+		 */
+		if (index->nhashcolumns == 0)
+		{
+			int32		range_width =
+				yb_get_index_tuple_width(index, baserel_oid, is_primary_index);
+			double		num_ranges;
+
+			if (!is_primary_index)
+				range_width += yb_get_ybctid_width(baserel_oid, index,
+												   is_primary_index) -
+					HIDDEN_COLUMNS_SIZE;
+			num_ranges = ceil(clamp_row_est(index_conditions_selectivity *
+											index->tuples) *
+							  range_width / yb_parallel_range_size);
+			parallel_divisor = fmin(parallel_divisor, fmax(num_ranges, 1.0));
+		}
+
 		adjusted_index_tuples = index->tuples / parallel_divisor;
 		num_seeks = ceil(num_seeks / parallel_divisor);
 		num_nexts = ceil(num_nexts / parallel_divisor);
@@ -10817,6 +10838,9 @@ yb_cost_bitmap_table_scan(Path *path, PlannerInfo *root, RelOptInfo *baserel,
 	double		first_batch_frac;
 	List	   *local_clauses = NIL;
 	List	   *non_index_clauses = NIL;
+	List	   *index_rinfos = NIL;
+	List	   *remote_rinfos = NIL;
+	Selectivity remote_selec = 1.0;
 	int			docdb_result_width;
 	Cardinality	tuples_fetched;
 	Cardinality	pages_fetched;
@@ -10893,7 +10917,10 @@ yb_cost_bitmap_table_scan(Path *path, PlannerInfo *root, RelOptInfo *baserel,
 		if (rinfo->pseudoconstant)
 			continue;			/* we may drop pseudoconstants here */
 		if (list_member(indexquals, clause))
+		{
+			index_rinfos = lappend(index_rinfos, rinfo);
 			continue;			/* simple duplicate */
+		}
 		if (!contain_mutable_functions(clause) &&
 			predicate_implied_by(list_make1(clause), indexquals, false))
 			continue;			/* provably implied by indexquals */
@@ -10915,17 +10942,38 @@ yb_cost_bitmap_table_scan(Path *path, PlannerInfo *root, RelOptInfo *baserel,
 								baserel_oid,
 								NULL);
 
-	tuples_fetched = clamp_row_est(adjusted_baserel_tuples *
-								   clauselist_selectivity(root, indexquals,
-														  baserel->relid,
-														  JOIN_INNER, NULL));
+	foreach(l, non_index_clauses)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, l);
 
-	result_tuples =
-		clamp_row_est(adjusted_baserel_tuples *
-					  clauselist_selectivity(root,
-											 list_union(indexquals,
-														remote_table_quals),
-											 baserel->relid, JOIN_INNER, NULL));
+		if (list_member_ptr(remote_table_quals, rinfo->clause))
+			remote_rinfos = lappend(remote_rinfos, rinfo);
+	}
+
+	tuples_fetched = clamp_row_est(adjusted_baserel_tuples * indexSelectivity);
+
+	if (remote_rinfos != NIL)
+	{
+		Selectivity index_rinfo_selec;
+
+		/*
+		 * Remote filter selectivity conditional on the index quals, so range
+		 * pairs and extended statistics spanning both lists still apply.
+		 */
+		index_rinfo_selec = clauselist_selectivity(root, index_rinfos,
+												   baserel->relid,
+												   JOIN_INNER, NULL);
+		remote_selec = clauselist_selectivity(root,
+											  list_concat(index_rinfos,
+														  remote_rinfos),
+											  baserel->relid,
+											  JOIN_INNER, NULL);
+		if (index_rinfo_selec > 0)
+			remote_selec = Min(remote_selec / index_rinfo_selec, 1.0);
+	}
+
+	result_tuples = clamp_row_est(adjusted_baserel_tuples * indexSelectivity *
+								  remote_selec);
 
 	pages_fetched = ceil(tuples_fetched * tuple_width / YB_DEFAULT_DOCDB_BLOCK_SIZE);
 

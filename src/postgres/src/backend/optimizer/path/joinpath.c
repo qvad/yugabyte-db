@@ -573,9 +573,9 @@ paraminfo_get_equal_hashops(PlannerInfo *root, ParamPathInfo *param_info,
  *		Otherwise return NULL.
  */
 static Path *
-get_memoize_path(PlannerInfo *root, RelOptInfo *innerrel,
-				 RelOptInfo *outerrel, Path *inner_path,
-				 Path *outer_path, JoinType jointype,
+get_memoize_path(PlannerInfo *root, RelOptInfo *joinrel,
+				 RelOptInfo *innerrel, RelOptInfo *outerrel,
+				 Path *inner_path, Path *outer_path, JoinType jointype,
 				 JoinPathExtraData *extra)
 {
 	RelOptInfo *top_outerrel;
@@ -583,6 +583,7 @@ get_memoize_path(PlannerInfo *root, RelOptInfo *innerrel,
 	List	   *hash_operators;
 	ListCell   *lc;
 	bool		binary_mode;
+	double		calls;
 
 	/* Obviously not if it's disabled */
 	if (!enable_memoize)
@@ -710,6 +711,20 @@ get_memoize_path(PlannerInfo *root, RelOptInfo *innerrel,
 									&hash_operators,
 									&binary_mode))
 	{
+		calls = outer_path->rows;
+
+		/*
+		 * YB: a LIMIT that stops this ordered top-level join early leaves
+		 * fewer calls, and so fewer cache hits, than the whole outer side.
+		 */
+		if (yb_enable_base_scans_cost_model &&
+			root->limit_tuples > 0 &&
+			joinrel->rows > root->limit_tuples &&
+			bms_equal(joinrel->relids, root->all_baserels) &&
+			pathkeys_contained_in(root->query_pathkeys, outer_path->pathkeys))
+			calls = Min(calls, root->limit_tuples * outerrel->rows /
+						joinrel->rows);
+
 		return (Path *) create_memoize_path(root,
 											innerrel,
 											inner_path,
@@ -717,7 +732,7 @@ get_memoize_path(PlannerInfo *root, RelOptInfo *innerrel,
 											hash_operators,
 											extra->inner_unique,
 											binary_mode,
-											outer_path->rows);
+											calls);
 	}
 
 	return NULL;
@@ -1960,7 +1975,7 @@ match_unsorted_outer(PlannerInfo *root,
 				 * Try generating a memoize path and see if that makes the
 				 * nested loop any cheaper.
 				 */
-				mpath = get_memoize_path(root, innerrel, outerrel,
+				mpath = get_memoize_path(root, joinrel, innerrel, outerrel,
 										 innerpath, outerpath, jointype,
 										 extra);
 				if (mpath != NULL)
@@ -2155,7 +2170,7 @@ consider_parallel_nestloop(PlannerInfo *root,
 			 * Try generating a memoize path and see if that makes the nested
 			 * loop any cheaper.
 			 */
-			mpath = get_memoize_path(root, innerrel, outerrel,
+			mpath = get_memoize_path(root, joinrel, innerrel, outerrel,
 									 innerpath, outerpath, jointype,
 									 extra);
 			if (mpath != NULL)

@@ -32,6 +32,7 @@
 #include "utils/lsyscache.h"
 
 /* YB includes */
+#include "common/hashfn.h"
 #include "partitioning/partbounds.h"
 #include "pg_yb_utils.h"
 
@@ -41,6 +42,13 @@ typedef struct JoinHashEntry
 	Relids		join_relids;	/* hash key --- MUST BE FIRST */
 	RelOptInfo *join_rel;
 } JoinHashEntry;
+
+typedef struct YbHintAliasHashEntry
+{
+	char	   *alias;			/* hash key --- MUST BE FIRST */
+	/* aliases <alias>_1 .. <alias>_(nextSuffix - 1) are all in use */
+	int			nextSuffix;
+} YbHintAliasHashEntry;
 
 static void build_joinrel_tlist(PlannerInfo *root, RelOptInfo *joinrel,
 								RelOptInfo *input_rel);
@@ -241,6 +249,99 @@ ybFindHintAlias(List *ybPlanHintsAliasMapping, char *hintAlias)
 	}
 
 	return found;
+}
+
+static uint32
+ybHintAliasHashFn(const void *key, Size keysize)
+{
+	const char *alias = *((char *const *) key);
+
+	return hash_bytes((const unsigned char *) alias, strlen(alias));
+}
+
+static int
+ybHintAliasMatchFn(const void *key1, const void *key2, Size keysize)
+{
+	return strcmp(*((char *const *) key1), *((char *const *) key2));
+}
+
+static void
+ybAddHintAliasToHash(HTAB *hashtab, char *hintAlias)
+{
+	YbHintAliasHashEntry *hentry;
+	bool		found;
+
+	hentry = (YbHintAliasHashEntry *) hash_search(hashtab, &hintAlias,
+												  HASH_ENTER, &found);
+	if (!found)
+		hentry->nextSuffix = 1;
+}
+
+static void
+ybBuildHintAliasHash(PlannerGlobal *glob)
+{
+	HASHCTL		hash_ctl;
+	ListCell   *lc;
+
+	hash_ctl.keysize = sizeof(char *);
+	hash_ctl.entrysize = sizeof(YbHintAliasHashEntry);
+	hash_ctl.hash = ybHintAliasHashFn;
+	hash_ctl.match = ybHintAliasMatchFn;
+	hash_ctl.hcxt = CurrentMemoryContext;
+	glob->ybHintAliasHash = hash_create("YbHintAliasHashTable",
+										256L,
+										&hash_ctl,
+										HASH_ELEM | HASH_FUNCTION |
+										HASH_COMPARE | HASH_CONTEXT);
+
+	foreach(lc, glob->ybPlanHintsAliasMapping)
+	{
+		char	   *existingAlias = (char *) lfirst(lc);
+
+		if (existingAlias != NULL)
+			ybAddHintAliasToHash(glob->ybHintAliasHash, existingAlias);
+	}
+}
+
+/*
+ * Return 'baseAlias' if it is not in ybPlanHintsAliasMapping, else the first
+ * of 'baseAlias'_1, 'baseAlias'_2, ... that is not.
+ */
+static char *
+ybChooseHintAlias(PlannerGlobal *glob, char *baseAlias)
+{
+	YbHintAliasHashEntry *hentry;
+	char	   *hintAlias;
+	int			aliasSuffix;
+
+	if (!glob->ybHintAliasHash &&
+		list_length(glob->ybPlanHintsAliasMapping) > 32)
+		ybBuildHintAliasHash(glob);
+
+	if (!glob->ybHintAliasHash)
+	{
+		hintAlias = baseAlias;
+		aliasSuffix = 1;
+		while (ybFindHintAlias(glob->ybPlanHintsAliasMapping, hintAlias))
+			hintAlias = psprintf("%s_%d", baseAlias, aliasSuffix++);
+		return hintAlias;
+	}
+
+	hentry = (YbHintAliasHashEntry *) hash_search(glob->ybHintAliasHash,
+												  &baseAlias, HASH_FIND, NULL);
+	if (hentry == NULL)
+		return baseAlias;
+
+	for (aliasSuffix = hentry->nextSuffix;; aliasSuffix++)
+	{
+		hintAlias = psprintf("%s_%d", baseAlias, aliasSuffix);
+		if (!hash_search(glob->ybHintAliasHash, &hintAlias, HASH_FIND, NULL))
+			break;
+		pfree(hintAlias);
+	}
+	hentry->nextSuffix = aliasSuffix + 1;
+
+	return hintAlias;
 }
 
 /*
@@ -465,42 +566,9 @@ build_simple_rel(PlannerInfo *root, int relid, RelOptInfo *parent)
 			rte->ybUniqueBaseId = rel->ybUniqueBaseId;
 
 			/*
-			 * Start with the existing rel alias.
+			 * Pick an alias that is unique in the global list (across all blocks).
 			 */
-			char	   *hintAlias = rte->eref->aliasname;
-
-			int			aliasSuffix = 1;
-			StringInfo	buf = NULL;
-
-			/*
-			 * Loop as long as the alias is found in the global list (across all blocks).
-			 */
-			while (ybFindHintAlias(glob->ybPlanHintsAliasMapping, hintAlias))
-			{
-				if (buf == NULL)
-				{
-					buf = makeStringInfo();
-				}
-				else
-				{
-					resetStringInfo(buf);
-				}
-
-				/*
-				 * Append the next numeric suffix.
-				 */
-				appendStringInfoString(buf, rte->eref->aliasname);
-				appendStringInfoString(buf, "_");
-				appendStringInfo(buf, "%d", aliasSuffix);
-				hintAlias = pstrdup(buf->data);
-				++aliasSuffix;
-			}
-
-			if (buf != NULL)
-			{
-				pfree(buf->data);
-				pfree(buf);
-			}
+			char	   *hintAlias = ybChooseHintAlias(glob, rte->eref->aliasname);
 
 			if (glob->ybPlanHintsAliasMapping == NIL)
 			{
@@ -515,6 +583,8 @@ build_simple_rel(PlannerInfo *root, int relid, RelOptInfo *parent)
 			 * Insert the alias we decided upon into the global list at position corresponding to rel's unique base relation id.
 			 */
 			glob->ybPlanHintsAliasMapping = list_insert_nth(glob->ybPlanHintsAliasMapping, rel->ybUniqueBaseId, hintAlias);
+			if (glob->ybHintAliasHash)
+				ybAddHintAliasToHash(glob->ybHintAliasHash, hintAlias);
 
 			/*
 			 * Store the info on the RTE and RelOptInfo.
