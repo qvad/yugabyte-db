@@ -7476,6 +7476,13 @@ yb_num_executors(Path *path)
 		(parallel_leader_participation ? 1.0 : 0.0);
 }
 
+static Cardinality
+yb_parallel_range_count(Cardinality range_tuples, int32 row_width)
+{
+	/* At least one parallel range exists overall. */
+	return fmax(ceil(range_tuples * row_width / yb_parallel_range_size), 1.0);
+}
+
 /*
  * Per-executor (= per-loop) page count for a parallel-range index walk.  The
  * swept on-disk volume is split into ceil(volume / yb_parallel_range_size)
@@ -7496,13 +7503,7 @@ yb_parallel_partition_pages(Cardinality range_tuples, int32 row_width,
 							double num_executors,
 							Cardinality saop_floor)
 {
-	Cardinality	total_pages = ceil(range_tuples * row_width /
-									   yb_parallel_range_size);
-
-	/* At least one parallel range exists overall. */
-	if (total_pages < 1.0)
-		total_pages = 1.0;
-
+	Cardinality	total_pages = yb_parallel_range_count(range_tuples, row_width);
 	Cardinality	pages = total_pages / num_executors;
 
 	if (saop_floor > pages)
@@ -9491,6 +9492,36 @@ yb_estimate_distinct_index_scan(PlannerInfo *root,
 }
 
 /*
+ * An IN list on the first key column sweeps the whole range between its
+ * smallest and largest element, not only the listed values.
+ */
+static Selectivity
+yb_first_key_swept_selectivity(PlannerInfo *root, Index relid, List *conds)
+{
+	List	   *range_conds = NIL;
+	Selectivity selec = 1.0;
+	ListCell   *lc;
+
+	foreach(lc, conds)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+		Selectivity saop_selec;
+		int			num_elems;
+
+		if (!IsA(rinfo->clause, ScalarArrayOpExpr))
+			range_conds = lappend(range_conds, rinfo);
+		else if (yb_estimate_saop_bounding_range_selectivity(root, rinfo,
+															 relid,
+															 &saop_selec,
+															 &num_elems))
+			selec *= saop_selec;
+	}
+
+	return selec * clauselist_selectivity(root, range_conds, relid,
+										  JOIN_INNER, NULL);
+}
+
+/*
  * yb_cost_index
  *		Determines and returns the cost of scanning a relation using an index.
  *		This is simlar to cost_index function but tailored for YB.
@@ -9937,6 +9968,13 @@ yb_cost_index(IndexPath *path, PlannerInfo *root, double loop_count,
 	else
 		num_nexts += num_dir_steps;
 
+	Selectivity first_key_swept_selectivity = 1.0;
+
+	if (path->path.parallel_workers > 0 && index->nhashcolumns == 0)
+		first_key_swept_selectivity =
+			yb_first_key_swept_selectivity(root, baserel->relid,
+										   index_conditions_on_each_column[0]);
+
 	pfree(index_conditions_on_each_column);
 
 	/*
@@ -9980,17 +10018,58 @@ yb_cost_index(IndexPath *path, PlannerInfo *root, double loop_count,
 					  cpu_operator_cost) +
 					 per_merge_cost);
 
+	index_tuple_width = yb_get_index_tuple_width(index, baserel_oid,
+												 is_primary_index);
+
+	ybctid_width = yb_get_ybctid_width(baserel_oid, index, is_primary_index);
+	path->ybctid_width = ybctid_width;
+
+	/*
+	 * Effective per-row width of an on-disk secondary index entry: the
+	 * indexed columns plus the encoded base-table ybctid that DocDB
+	 * stores with each row.  index_tuple_width's HIDDEN_COLUMNS_SIZE
+	 * filler under-approximates the ybctid encoding, so swap it for
+	 * the real encoded width when sizing parallel-range partitions.
+	 *
+	 * For a PK the entry is the whole base row, so the encoded-key
+	 * overhead (which would also be data-type/composite dependent) is a
+	 * small share of the row width; the HIDDEN_COLUMNS_SIZE filler is
+	 * close enough for partition sizing, so leave index_tuple_width as is.
+	 */
+	int32		disk_index_tuple_width =
+		(is_primary_index ?
+		 index_tuple_width :
+		 (index_tuple_width - HIDDEN_COLUMNS_SIZE + ybctid_width));
+
 	/* Adjust costing for parallelism, if used. */
 	Cardinality	adjusted_index_tuples = index->tuples;
 	double		num_executors = yb_num_executors(&path->path);
 
 	if (path->path.parallel_workers > 0)
 	{
+		double		work_divisor;
+
 		parallel_divisor = get_parallel_divisor(&path->path);
-		adjusted_index_tuples = index->tuples / parallel_divisor;
-		num_seeks = ceil(num_seeks / parallel_divisor);
-		num_nexts = ceil(num_nexts / parallel_divisor);
-		num_prevs = ceil(num_prevs / parallel_divisor);
+		work_divisor = parallel_divisor;
+
+		/*
+		 * Processes beyond the parallel ranges the scan sweeps get no work.
+		 * Rows and request pages stay averages over all processes.
+		 */
+		if (index->nhashcolumns == 0)
+		{
+			Cardinality	swept_tuples =
+				clamp_row_est(first_key_swept_selectivity * index->tuples);
+
+			work_divisor = fmin(parallel_divisor,
+								yb_parallel_range_count(swept_tuples,
+														disk_index_tuple_width));
+		}
+
+		adjusted_index_tuples = index->tuples / work_divisor;
+		num_seeks = ceil(num_seeks / work_divisor);
+		num_nexts = ceil(num_nexts / work_divisor);
+		num_prevs = ceil(num_prevs / work_divisor);
 		path->path.rows = clamp_row_est(path->path.rows / parallel_divisor);
 	}
 
@@ -10143,9 +10222,6 @@ yb_cost_index(IndexPath *path, PlannerInfo *root, double loop_count,
 	first_fetch_limit = yb_first_fetch_limit(root, &path->path,
 											 local_clauses != NIL);
 
-	index_tuple_width = yb_get_index_tuple_width(index, baserel_oid,
-												 is_primary_index);
-
 	/*
 	 * Per-worker SAOP page floor.  A colocated PK SAOP is dispatched by pggate
 	 * as one ybctid batch to the single colocated tablet
@@ -10179,12 +10255,6 @@ yb_cost_index(IndexPath *path, PlannerInfo *root, double loop_count,
 			fmin((double) num_sa_scans, fmax(saop_pages_per_worker, 1.0));
 	}
 
-	/*
-	 * Compute ybctid and the final result width.
-	 */
-	ybctid_width = yb_get_ybctid_width(baserel_oid, index, is_primary_index);
-	path->ybctid_width = ybctid_width;
-
 	docdb_result_width = yb_get_docdb_result_width(&path->path, root,
 												   true,	/* is_index_path */
 												   is_primary_index,
@@ -10192,23 +10262,6 @@ yb_cost_index(IndexPath *path, PlannerInfo *root, double loop_count,
 												   index_conditions,
 												   local_clauses,
 												   baserel, baserel_oid);
-
-	/*
-	 * Effective per-row width of an on-disk secondary index entry: the
-	 * indexed columns plus the encoded base-table ybctid that DocDB
-	 * stores with each row.  index_tuple_width's HIDDEN_COLUMNS_SIZE
-	 * filler under-approximates the ybctid encoding, so swap it for
-	 * the real encoded width when sizing parallel-range partitions.
-	 *
-	 * For a PK the entry is the whole base row, so the encoded-key
-	 * overhead (which would also be data-type/composite dependent) is a
-	 * small share of the row width; the HIDDEN_COLUMNS_SIZE filler is
-	 * close enough for partition sizing, so leave index_tuple_width as is.
-	 */
-	int32		disk_index_tuple_width =
-		(is_primary_index ?
-		 index_tuple_width :
-		 (index_tuple_width - HIDDEN_COLUMNS_SIZE + ybctid_width));
 
 	/*
 	 * Compute the cost of transfering ybctids from DocDB.
