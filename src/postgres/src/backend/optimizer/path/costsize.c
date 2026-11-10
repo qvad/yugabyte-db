@@ -10005,6 +10005,17 @@ yb_cost_index(IndexPath *path, PlannerInfo *root, double loop_count,
 			num_ranges = ceil(clamp_row_est(index_conditions_selectivity *
 											index->tuples) *
 							  range_width / yb_parallel_range_size);
+
+			/* Each IN-list element is scanned as its own range. */
+			foreach(lc, index_conditions)
+			{
+				RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+
+				if (rinfo != NULL && IsA(rinfo->clause, ScalarArrayOpExpr))
+					num_ranges = fmax(num_ranges,
+									  estimate_array_length(lsecond(((ScalarArrayOpExpr *)
+																	 rinfo->clause)->args)));
+			}
 			parallel_divisor = fmin(parallel_divisor, fmax(num_ranges, 1.0));
 		}
 
